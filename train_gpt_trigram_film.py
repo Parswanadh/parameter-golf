@@ -43,6 +43,9 @@ if "--eval-only" in sys.argv:
     if idx + 1 >= len(sys.argv):
         raise ValueError("--eval-only requires a checkpoint path argument")
     EVAL_ONLY_CHECKPOINT = sys.argv[idx + 1]
+EVAL_ONLY_ENV = os.environ.get("EVAL_ONLY", "0") == "1"
+if EVAL_ONLY_ENV and EVAL_ONLY_CHECKPOINT is None:
+    EVAL_ONLY_CHECKPOINT = os.environ.get("EVAL_ONLY_CHECKPOINT", "final_model.pt")
 
 TERNARY_ENABLED = os.environ.get("TERNARY_ENABLED", "0") == "1"
 TRIGRAM_ENABLED = os.environ.get("TRIGRAM_ENABLED", "1") == "1"
@@ -107,6 +110,10 @@ class Hyperparameters:
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))
     swa_every = int(os.environ.get("SWA_EVERY", 50))
+
+    checkpoint_steps = int(os.environ.get("CHECKPOINT_STEPS", 0))
+    checkpoint_keep_last = int(os.environ.get("CHECKPOINT_KEEP_LAST", 3))
+    checkpoint_dir = os.environ.get("CHECKPOINT_DIR", "checkpoints")
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -680,6 +687,111 @@ def deserialize_quantized_state(quant_blob: bytes) -> tuple[dict[str, Tensor], d
         decompressed = zlib.decompress(quant_blob)
     quant_state = torch.load(io.BytesIO(decompressed), map_location="cpu")
     return quant_state["w"], quant_state["m"]
+
+
+def _checkpoint_step_from_path(path: Path) -> int | None:
+    stem = path.stem
+    if not stem.startswith("step_"):
+        return None
+    suffix = stem[len("step_") :]
+    if not suffix.isdigit():
+        return None
+    return int(suffix)
+
+
+def _list_step_checkpoints(checkpoint_dir: Path) -> list[tuple[int, Path]]:
+    if not checkpoint_dir.exists():
+        return []
+    paths: list[tuple[int, Path]] = []
+    for path in checkpoint_dir.glob("step_*.pt"):
+        step = _checkpoint_step_from_path(path)
+        if step is not None:
+            paths.append((step, path))
+    paths.sort(key=lambda x: x[0])
+    return paths
+
+
+def _latest_step_checkpoint(checkpoint_dir: Path) -> Path | None:
+    paths = _list_step_checkpoints(checkpoint_dir)
+    return paths[-1][1] if paths else None
+
+
+def _move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device=device, non_blocking=True)
+
+
+def load_training_checkpoint(
+    checkpoint_path: Path,
+    model: nn.Module,
+    optimizers: list[torch.optim.Optimizer],
+    device: torch.device,
+) -> tuple[int, float, dict[str, Tensor] | None, int]:
+    state = torch.load(checkpoint_path, map_location="cpu")
+    if not isinstance(state, dict):
+        raise RuntimeError(f"Checkpoint must be a dict: {checkpoint_path}")
+    if "model_state_dict" not in state or "step" not in state:
+        raise RuntimeError(f"Checkpoint missing model_state_dict/step: {checkpoint_path}")
+    model_state = state["model_state_dict"]
+    if not isinstance(model_state, dict):
+        raise RuntimeError(f"Checkpoint model_state_dict invalid: {checkpoint_path}")
+    model.load_state_dict(model_state, strict=True)
+
+    opt_states = state.get("optimizer_states")
+    if not isinstance(opt_states, list) or len(opt_states) != len(optimizers):
+        raise RuntimeError(
+            f"Checkpoint optimizer state count mismatch: expected {len(optimizers)}, got {len(opt_states) if isinstance(opt_states, list) else 'invalid'}"
+        )
+    for opt, opt_state in zip(optimizers, opt_states, strict=True):
+        opt.load_state_dict(opt_state)
+        _move_optimizer_state_to_device(opt, device)
+
+    ckpt_step = int(state["step"])
+    training_time_ms = float(state.get("training_time_ms", 0.0))
+    swa_count = int(state.get("swa_count", 0))
+    swa_state_raw = state.get("swa_state")
+    if swa_state_raw is not None and not isinstance(swa_state_raw, dict):
+        raise RuntimeError(f"Checkpoint swa_state invalid type: {type(swa_state_raw)}")
+    swa_state = (
+        {name: tensor.detach().cpu() for name, tensor in swa_state_raw.items()}
+        if isinstance(swa_state_raw, dict)
+        else None
+    )
+    return ckpt_step, training_time_ms, swa_state, swa_count
+
+
+def save_training_checkpoint(
+    checkpoint_dir: Path,
+    step: int,
+    model: nn.Module,
+    optimizers: list[torch.optim.Optimizer],
+    training_time_ms: float,
+    swa_state: dict[str, Tensor] | None,
+    swa_count: int,
+    keep_last: int = 3,
+) -> Path:
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = checkpoint_dir / f"step_{step}.pt"
+    payload: dict[str, object] = {
+        "step": int(step),
+        "model_state_dict": model.state_dict(),
+        "optimizer_states": [opt.state_dict() for opt in optimizers],
+        "training_time_ms": float(training_time_ms),
+        "swa_count": int(swa_count),
+    }
+    if swa_state is not None:
+        payload["swa_state"] = {name: tensor.detach().cpu() for name, tensor in swa_state.items()}
+    torch.save(payload, checkpoint_path)
+
+    keep = max(int(keep_last), 1)
+    all_ckpts = _list_step_checkpoints(checkpoint_dir)
+    if len(all_ckpts) > keep:
+        for _, old_path in all_ckpts[:-keep]:
+            if old_path != checkpoint_path and old_path.exists():
+                old_path.unlink()
+    return checkpoint_path
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -1294,23 +1406,45 @@ def main() -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
+    checkpoint_steps = max(int(args.checkpoint_steps), 0)
+    checkpoint_keep_last = max(int(args.checkpoint_keep_last), 1)
+    checkpoint_dir = Path(args.checkpoint_dir)
+
+    resume_step = 0
+    training_time_ms = 0.0
+    swa_state: dict[str, Tensor] | None = None
+    swa_count = 0
+
     eval_only_mode = EVAL_ONLY_CHECKPOINT is not None
     if eval_only_mode:
         ckpt_path = Path(EVAL_ONLY_CHECKPOINT)
         if not ckpt_path.is_absolute():
             ckpt_path = (Path.cwd() / ckpt_path).resolve()
         if not ckpt_path.exists():
-            raise FileNotFoundError(f"--eval-only checkpoint not found: {ckpt_path}")
+            raise FileNotFoundError(f"eval-only checkpoint not found: {ckpt_path}")
         log0(f"eval_only:loading checkpoint {ckpt_path}")
         state = torch.load(ckpt_path, map_location="cpu")
         if isinstance(state, dict) and "model_state_dict" in state and isinstance(state["model_state_dict"], dict):
             state = state["model_state_dict"]
         if not isinstance(state, dict):
-            raise RuntimeError("--eval-only checkpoint must be a state_dict or contain model_state_dict.")
+            raise RuntimeError("eval-only checkpoint must be a state_dict or contain model_state_dict.")
         base_model.load_state_dict(state, strict=True)
         log0("eval_only:training skipped")
     else:
-        if args.warmup_steps > 0:
+        if checkpoint_steps > 0:
+            latest_ckpt = _latest_step_checkpoint(checkpoint_dir)
+            if latest_ckpt is not None:
+                resume_step, training_time_ms, swa_state, swa_count = load_training_checkpoint(
+                    latest_ckpt, base_model, optimizers, device
+                )
+                log0(
+                    f"checkpoint:resumed path:{latest_ckpt} step:{resume_step} "
+                    f"training_time_ms:{training_time_ms:.0f}"
+                )
+            else:
+                log0(f"checkpoint:none_found dir:{checkpoint_dir}")
+
+        if args.warmup_steps > 0 and resume_step == 0:
             initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
             initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
             model.train()
@@ -1335,16 +1469,15 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = True
             train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        elif args.warmup_steps > 0 and resume_step > 0:
+            log0("warmup:skipped due to checkpoint resume")
 
         # MAIN TRAINING LOOP
-        training_time_ms = 0.0
         stop_after_step: int | None = None
-        swa_state: dict[str, Tensor] | None = None
-        swa_count = 0
         torch.cuda.synchronize()
         t0 = time.perf_counter()
 
-        step = 0
+        step = resume_step
         while True:
             last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
@@ -1423,6 +1556,22 @@ def main() -> None:
                     f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                     f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
                 )
+
+            if checkpoint_steps > 0 and step > 0 and step % checkpoint_steps == 0:
+                if master_process:
+                    checkpoint_path = save_training_checkpoint(
+                        checkpoint_dir=checkpoint_dir,
+                        step=step,
+                        model=base_model,
+                        optimizers=optimizers,
+                        training_time_ms=approx_training_time_ms,
+                        swa_state=swa_state,
+                        swa_count=swa_count,
+                        keep_last=checkpoint_keep_last,
+                    )
+                    log0(f"checkpoint:saved path:{checkpoint_path}")
+                if distributed:
+                    dist.barrier()
 
             reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
             if distributed and max_wallclock_ms is not None:
@@ -1517,6 +1666,7 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_bpb:{q_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
