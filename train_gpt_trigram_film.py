@@ -37,6 +37,12 @@ if "--ternary" in sys.argv:
     os.environ["TERNARY_ENABLED"] = "1"
 if "--no-ternary" in sys.argv:
     os.environ["TERNARY_ENABLED"] = "0"
+EVAL_ONLY_CHECKPOINT: str | None = None
+if "--eval-only" in sys.argv:
+    idx = sys.argv.index("--eval-only")
+    if idx + 1 >= len(sys.argv):
+        raise ValueError("--eval-only requires a checkpoint path argument")
+    EVAL_ONLY_CHECKPOINT = sys.argv[idx + 1]
 
 TERNARY_ENABLED = os.environ.get("TERNARY_ENABLED", "0") == "1"
 TRIGRAM_ENABLED = os.environ.get("TRIGRAM_ENABLED", "1") == "1"
@@ -648,6 +654,32 @@ def set_static_ternary_weights_from_state(model: nn.Module, state_dict: dict[str
         if key not in state_dict:
             raise KeyError(f"Missing ternary weight in restored state: {key}")
         module.set_static_ternary_weight(state_dict[key])
+
+
+def serialize_quantized_state(
+    sd_cpu: dict[str, Tensor],
+    ternary_enabled: bool,
+) -> tuple[dict[str, Tensor], dict[str, object], bytes]:
+    quant_result, quant_meta = mixed_quantize_int6(
+        sd_cpu, {"mlp", "attn", "bigram", "trigram"}, ternary_enabled=ternary_enabled
+    )
+    quant_buf = io.BytesIO()
+    torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
+    quant_raw = quant_buf.getvalue()
+    if _COMPRESSOR == "zstd":
+        quant_blob = zstandard.ZstdCompressor(level=22).compress(quant_raw)
+    else:
+        quant_blob = zlib.compress(quant_raw, 9)
+    return quant_result, quant_meta, quant_blob
+
+
+def deserialize_quantized_state(quant_blob: bytes) -> tuple[dict[str, Tensor], dict[str, object]]:
+    if _COMPRESSOR == "zstd":
+        decompressed = zstandard.ZstdDecompressor().decompress(quant_blob)
+    else:
+        decompressed = zlib.decompress(quant_blob)
+    quant_state = torch.load(io.BytesIO(decompressed), map_location="cpu")
+    return quant_state["w"], quant_state["m"]
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -1262,142 +1294,158 @@ def main() -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
-    if args.warmup_steps > 0:
-        initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
-        initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
-        model.train()
-        for warmup_step in range(args.warmup_steps):
+    eval_only_mode = EVAL_ONLY_CHECKPOINT is not None
+    if eval_only_mode:
+        ckpt_path = Path(EVAL_ONLY_CHECKPOINT)
+        if not ckpt_path.is_absolute():
+            ckpt_path = (Path.cwd() / ckpt_path).resolve()
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"--eval-only checkpoint not found: {ckpt_path}")
+        log0(f"eval_only:loading checkpoint {ckpt_path}")
+        state = torch.load(ckpt_path, map_location="cpu")
+        if isinstance(state, dict) and "model_state_dict" in state and isinstance(state["model_state_dict"], dict):
+            state = state["model_state_dict"]
+        if not isinstance(state, dict):
+            raise RuntimeError("--eval-only checkpoint must be a state_dict or contain model_state_dict.")
+        base_model.load_state_dict(state, strict=True)
+        log0("eval_only:training skipped")
+    else:
+        if args.warmup_steps > 0:
+            initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
+            initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
+            model.train()
+            for warmup_step in range(args.warmup_steps):
+                zero_grad_all()
+                for micro_step in range(grad_accum_steps):
+                    if distributed:
+                        model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+                    x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        warmup_loss = model(x, y)
+                    (warmup_loss * grad_scale).backward()
+                for opt in optimizers:
+                    opt.step()
+                zero_grad_all()
+                if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
+                    log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+            base_model.load_state_dict(initial_model_state, strict=True)
+            for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
+                opt.load_state_dict(state)
             zero_grad_all()
+            if distributed:
+                model.require_backward_grad_sync = True
+            train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+        # MAIN TRAINING LOOP
+        training_time_ms = 0.0
+        stop_after_step: int | None = None
+        swa_state: dict[str, Tensor] | None = None
+        swa_count = 0
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+
+        step = 0
+        while True:
+            last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
+
+            should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
+            if should_validate:
+                torch.cuda.synchronize()
+                training_time_ms += 1000.0 * (time.perf_counter() - t0)
+                val_loss, val_bpb = eval_val(
+                    args, model, rank, world_size, device, grad_accum_steps,
+                    val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                )
+                log0(
+                    f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
+                    f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
+                )
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+
+            if last_step:
+                if stop_after_step is not None and step < args.iterations:
+                    log0(
+                        f"stopping_early: wallclock_cap train_time:{training_time_ms:.0f}ms "
+                        f"step:{step}/{args.iterations}"
+                    )
+                break
+
+            elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+            scale = lr_mul(step, elapsed_ms)
+            zero_grad_all()
+            train_loss = torch.zeros((), device=device)
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y)
-                (warmup_loss * grad_scale).backward()
+                    loss = model(x, y)
+                train_loss += loss.detach()
+                (loss * grad_scale).backward()
+            train_loss /= grad_accum_steps
+
+            frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+            muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+            for group in optimizer_muon.param_groups:
+                group["momentum"] = muon_momentum
+
+            for opt in optimizers:
+                for group in opt.param_groups:
+                    group["lr"] = group["base_lr"] * scale
+
+            if args.grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
             for opt in optimizers:
                 opt.step()
             zero_grad_all()
-            if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
-                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
-        base_model.load_state_dict(initial_model_state, strict=True)
-        for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
-            opt.load_state_dict(state)
-        zero_grad_all()
-        if distributed:
-            model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
-    # MAIN TRAINING LOOP
-    training_time_ms = 0.0
-    stop_after_step: int | None = None
-    swa_state: dict[str, Tensor] | None = None
-    swa_count = 0
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
+            step += 1
+            approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
 
-    step = 0
-    while True:
-        last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
+            # SWA: collect checkpoints during warmdown
+            if args.swa_enabled and scale < args.swa_start_frac and step % args.swa_every == 0:
+                if swa_state is None:
+                    swa_state = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
+                    swa_count = 1
+                    log0(f"swa:start step:{step}")
+                else:
+                    for name, t in base_model.state_dict().items():
+                        swa_state[name] += t.detach().cpu()
+                    swa_count += 1
 
-        should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
-        if should_validate:
-            torch.cuda.synchronize()
-            training_time_ms += 1000.0 * (time.perf_counter() - t0)
-            val_loss, val_bpb = eval_val(
-                args, model, rank, world_size, device, grad_accum_steps,
-                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            should_log_train = (
+                args.train_log_every > 0
+                and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
             )
-            log0(
-                f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
-            )
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-
-        if last_step:
-            if stop_after_step is not None and step < args.iterations:
+            if should_log_train:
                 log0(
-                    f"stopping_early: wallclock_cap train_time:{training_time_ms:.0f}ms "
-                    f"step:{step}/{args.iterations}"
+                    f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+                    f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
                 )
-            break
 
-        elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        scale = lr_mul(step, elapsed_ms)
-        zero_grad_all()
-        train_loss = torch.zeros((), device=device)
-        for micro_step in range(grad_accum_steps):
-            if distributed:
-                model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
-            train_loss += loss.detach()
-            (loss * grad_scale).backward()
-        train_loss /= grad_accum_steps
+            reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
+            if distributed and max_wallclock_ms is not None:
+                reached_cap_tensor = torch.tensor(int(reached_cap), device=device)
+                dist.all_reduce(reached_cap_tensor, op=dist.ReduceOp.MAX)
+                reached_cap = bool(reached_cap_tensor.item())
+            if stop_after_step is None and reached_cap:
+                stop_after_step = step
 
-        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-        for group in optimizer_muon.param_groups:
-            group["momentum"] = muon_momentum
-
-        for opt in optimizers:
-            for group in opt.param_groups:
-                group["lr"] = group["base_lr"] * scale
-
-        if args.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
-        for opt in optimizers:
-            opt.step()
-        zero_grad_all()
-
-        step += 1
-        approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-
-        # SWA: collect checkpoints during warmdown
-        if args.swa_enabled and scale < args.swa_start_frac and step % args.swa_every == 0:
-            if swa_state is None:
-                swa_state = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
-                swa_count = 1
-                log0(f"swa:start step:{step}")
-            else:
-                for name, t in base_model.state_dict().items():
-                    swa_state[name] += t.detach().cpu()
-                swa_count += 1
-
-        should_log_train = (
-            args.train_log_every > 0
-            and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
+        log0(
+            f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+            f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
         )
-        if should_log_train:
-            log0(
-                f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
-            )
 
-        reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
-        if distributed and max_wallclock_ms is not None:
-            reached_cap_tensor = torch.tensor(int(reached_cap), device=device)
-            dist.all_reduce(reached_cap_tensor, op=dist.ReduceOp.MAX)
-            reached_cap = bool(reached_cap_tensor.item())
-        if stop_after_step is None and reached_cap:
-            stop_after_step = step
-
-    log0(
-        f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
-        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-
-    # Apply SWA if collected
-    if args.swa_enabled and swa_state is not None and swa_count > 1:
-        log0(f"swa:applying averaged {swa_count} checkpoints")
-        current_state = base_model.state_dict()
-        avg_state = {
-            name: (tensor / swa_count).to(dtype=current_state[name].dtype)
-            for name, tensor in swa_state.items()
-        }
-        base_model.load_state_dict(avg_state, strict=True)
+        # Apply SWA if collected
+        if args.swa_enabled and swa_state is not None and swa_count > 1:
+            log0(f"swa:applying averaged {swa_count} checkpoints")
+            current_state = base_model.state_dict()
+            avg_state = {
+                name: (tensor / swa_count).to(dtype=current_state[name].dtype)
+                for name, tensor in swa_state.items()
+            }
+            base_model.load_state_dict(avg_state, strict=True)
 
     # SERIALIZATION + ROUNDTRIP VALIDATION
     if master_process:
@@ -1409,25 +1457,17 @@ def main() -> None:
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
     # Magnitude pruning: zero out smallest weights to improve compression
-    with torch.no_grad():
-        for name, param in base_model.named_parameters():
-            if param.ndim == 2 and param.numel() > 65536:
-                threshold = torch.quantile(param.abs().float().flatten(), 0.03)
-                mask = param.abs() < threshold
-                param.masked_fill_(mask, 0.0)
+    if not eval_only_mode:
+        with torch.no_grad():
+            for name, param in base_model.named_parameters():
+                if param.ndim == 2 and param.numel() > 65536:
+                    threshold = torch.quantile(param.abs().float().flatten(), 0.03)
+                    mask = param.abs() < threshold
+                    param.masked_fill_(mask, 0.0)
 
     # INT6 mixed quantization + zstd/zlib export
     sd_cpu = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
-    quant_result, quant_meta = mixed_quantize_int6(
-        sd_cpu, {"mlp", "attn", "bigram", "trigram"}, ternary_enabled=TERNARY_ENABLED
-    )
-    quant_buf = io.BytesIO()
-    torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
-    quant_raw = quant_buf.getvalue()
-    if _COMPRESSOR == "zstd":
-        quant_blob = zstandard.ZstdCompressor(level=22).compress(quant_raw)
-    else:
-        quant_blob = zlib.compress(quant_raw, 9)
+    quant_result, quant_meta, quant_blob = serialize_quantized_state(sd_cpu, ternary_enabled=TERNARY_ENABLED)
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
             f.write(quant_blob)
@@ -1448,13 +1488,9 @@ def main() -> None:
         dist.barrier()
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    if _COMPRESSOR == "zstd":
-        decompressed = zstandard.ZstdDecompressor().decompress(quant_blob_disk)
-    else:
-        decompressed = zlib.decompress(quant_blob_disk)
-    quant_state = torch.load(io.BytesIO(decompressed), map_location="cpu")
-    deq_state = dequantize_mixed_int6(quant_state["w"], quant_state["m"], sd_cpu)
-    run_ternary_roundtrip_checks(base_model, quant_state["w"], quant_state["m"], deq_state, log0)
+    quant_w, quant_m = deserialize_quantized_state(quant_blob_disk)
+    deq_state = dequantize_mixed_int6(quant_w, quant_m, sd_cpu)
+    run_ternary_roundtrip_checks(base_model, quant_w, quant_m, deq_state, log0)
     base_model.load_state_dict(deq_state, strict=True)
     if TERNARY_ENABLED:
         set_static_ternary_weights_from_state(base_model, deq_state)
