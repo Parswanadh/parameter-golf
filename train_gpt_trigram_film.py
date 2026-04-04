@@ -371,28 +371,41 @@ def quantize_intN_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tens
     return q, scale
 
 def pack_ternary_2bit(q_vals: Tensor) -> Tensor:
-    flat = (q_vals.to(torch.int16) + 1).to(torch.uint8).reshape(-1)
-    pad = (-flat.numel()) % 4
+    q_int = q_vals.to(torch.int8).reshape(-1).contiguous()
+    if q_int.numel() > 0:
+        q_min = int(q_int.min().item())
+        q_max = int(q_int.max().item())
+        assert q_min >= -1 and q_max <= 1, (
+            f"Ternary pack input out of range: min={q_min} max={q_max}"
+        )
+    mapped = q_int.to(torch.int16) + 1  # {-1,0,1} -> {0,1,2}
+    pad = (-mapped.numel()) % 4
     if pad:
-        flat = torch.cat([flat, torch.zeros(pad, dtype=torch.uint8)], dim=0)
+        mapped = torch.cat(
+            [mapped, torch.zeros(pad, dtype=torch.int16, device=mapped.device)], dim=0
+        )
+    v0 = mapped[0::4]
+    v1 = mapped[1::4]
+    v2 = mapped[2::4]
+    v3 = mapped[3::4]
     packed = (
-        (flat[0::4] & 0x03)
-        | ((flat[1::4] & 0x03) << 2)
-        | ((flat[2::4] & 0x03) << 4)
-        | ((flat[3::4] & 0x03) << 6)
-    )
+        (v0 & 0x03)
+        | ((v1 & 0x03) << 2)
+        | ((v2 & 0x03) << 4)
+        | ((v3 & 0x03) << 6)
+    ).to(torch.uint8)
     return packed.contiguous()
 
 
 def unpack_ternary_2bit(packed: Tensor, numel: int) -> Tensor:
-    p = packed.reshape(-1).to(torch.uint8)
-    out = torch.empty(p.numel() * 4, dtype=torch.uint8)
+    p = packed.reshape(-1).to(torch.int16)
+    out = torch.empty(p.numel() * 4, dtype=torch.int16, device=p.device)
     out[0::4] = p & 0x03
     out[1::4] = (p >> 2) & 0x03
     out[2::4] = (p >> 4) & 0x03
     out[3::4] = (p >> 6) & 0x03
-    out = out[:numel].to(torch.int8) - 1
-    return out
+    out = out[:numel] - 1
+    return out.to(torch.int8).contiguous()
 
 
 def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str], ternary_enabled: bool = False):
@@ -415,8 +428,8 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str], tern
             continue
         if ternary_enabled and t.ndim == 2 and (".attn." in name or ".mlp." in name):
             scale = t.abs().mean().clamp_min(1e-8).to(torch.float16)
-            q = (t / scale.float()).round().clamp(-1, 1).to(torch.int8).contiguous()
-            result[name + ".q2"] = pack_ternary_2bit(q)
+            q_int = (t / scale.float()).round().clamp(-1, 1).to(torch.int8).contiguous()
+            result[name + ".q2"] = pack_ternary_2bit(q_int)
             result[name + ".shape"] = torch.tensor(t.shape, dtype=torch.int32)
             result[name + ".scale"] = scale
             meta[name] = {"type": "ternary2"}
@@ -500,8 +513,7 @@ def run_ternary_roundtrip_checks(
         raise RuntimeError(f"Ternary scale for {weight_key} must be scalar, got shape {tuple(scale_saved.shape)}")
 
     w_orig = first_module.weight.detach().cpu().float().contiguous()
-    scale_orig = w_orig.abs().mean().clamp_min(1e-8)
-    q_orig = (w_orig / scale_orig).round().clamp(-1, 1).to(torch.int8).contiguous()
+    q_orig = (w_orig / scale_saved).round().clamp(-1, 1).to(torch.int8).contiguous()
     q_restored = unpack_ternary_2bit(packed_state[weight_key + ".q2"], int(np.prod(shape))).view(shape).to(torch.int8)
     if not torch.equal(q_orig, q_restored):
         diff_count = int((q_orig != q_restored).sum().item())
@@ -514,8 +526,7 @@ def run_ternary_roundtrip_checks(
     max_abs_diff = float((w_expected - w_restored).abs().max().item())
     log_fn(f"ternary_roundtrip layer:{weight_key} q_bit_exact:True")
     log_fn(
-        f"ternary_roundtrip layer:{weight_key} scale_saved:{float(scale_saved.item()):.8e} "
-        f"scale_orig:{float(scale_orig.item()):.8e}"
+        f"ternary_roundtrip layer:{weight_key} scale_saved:{float(scale_saved.item()):.8e}"
     )
     log_fn(f"dequant_sanity layer:{weight_key} max_abs_diff:{max_abs_diff:.8e}")
 
