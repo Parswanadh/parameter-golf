@@ -110,6 +110,8 @@ class Hyperparameters:
     slot_lr = float(os.environ.get("SLOT_LR", 0.008))
     slot_lr_min = float(os.environ.get("SLOT_LR_MIN", 0.0008))
     slot_batch_seqs = int(os.environ.get("SLOT_BATCH_SEQS", 32))
+    slot_tokens = int(os.environ.get("SLOT_TOKENS", 16))
+    slot_trigram_topk = int(os.environ.get("SLOT_TRIGRAM_TOPK", 32))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -1025,13 +1027,31 @@ class GPT(nn.Module):
             if mtp_loss_count > 0:
                 main_loss = main_loss + self.mtp_loss_weight * (mtp_loss_sum / mtp_loss_count)
         return main_loss
-    def forward_hidden(self, input_ids: Tensor) -> Tensor:
+    def _forward_hidden_with_optional_slots(
+        self,
+        input_ids: Tensor,
+        slot_prefix: Tensor | None,
+    ) -> Tensor:
         n = self.num_layers
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
+        slot_len = 0
+        if slot_prefix is not None:
+            if slot_prefix.ndim != 3:
+                raise ValueError(f"slot_prefix must be rank-3 [B,S,C], got shape {tuple(slot_prefix.shape)}")
+            if slot_prefix.size(0) != x.size(0):
+                raise ValueError(
+                    f"slot_prefix batch mismatch: slot_prefix B={slot_prefix.size(0)} vs input B={x.size(0)}"
+                )
+            if slot_prefix.size(2) != x.size(2):
+                raise ValueError(
+                    f"slot_prefix dim mismatch: slot_prefix C={slot_prefix.size(2)} vs model C={x.size(2)}"
+                )
+            slot_len = int(slot_prefix.size(1))
+            x = torch.cat([slot_prefix.to(dtype=x.dtype), x], dim=1)
         x0 = x
         v0 = None
         skips: list[Tensor] = []
@@ -1040,6 +1060,11 @@ class GPT(nn.Module):
             if self.film is not None:
                 x = self.film.condition(x, i)
             ve = self._get_ve(i, input_ids, ve_cache)
+            if ve is not None and slot_len > 0:
+                ve_pad = torch.zeros(
+                    ve.size(0), slot_len, ve.size(2), dtype=ve.dtype, device=ve.device
+                )
+                ve = torch.cat([ve_pad, ve], dim=1)
             x, raw_v = self.blocks[i](x, x0,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
                 self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
@@ -1054,11 +1079,22 @@ class GPT(nn.Module):
             if self.film is not None:
                 x = self.film.condition(x, bi)
             ve = self._get_ve(bi, input_ids, ve_cache)
+            if ve is not None and slot_len > 0:
+                ve_pad = torch.zeros(
+                    ve.size(0), slot_len, ve.size(2), dtype=ve.dtype, device=ve.device
+                )
+                ve = torch.cat([ve_pad, ve], dim=1)
             x, _ = self.blocks[bi](x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
                 self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
                 v_embed=ve, v0=v0)
         return self.final_norm(x)
+
+    def forward_hidden(self, input_ids: Tensor) -> Tensor:
+        return self._forward_hidden_with_optional_slots(input_ids, slot_prefix=None)
+
+    def forward_hidden_with_slots(self, input_ids: Tensor, slot_tokens: Tensor) -> Tensor:
+        return self._forward_hidden_with_optional_slots(input_ids, slot_prefix=slot_tokens)
 
     def compute_logits(self, hidden: Tensor) -> Tensor:
         if self.tie_embeddings:
@@ -1069,6 +1105,11 @@ class GPT(nn.Module):
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         return self.compute_logits(self.forward_hidden(input_ids))
+
+    def forward_logits_with_slots(self, input_ids: Tensor, slot_tokens: Tensor) -> Tensor:
+        hidden = self.forward_hidden_with_slots(input_ids, slot_tokens)
+        slot_len = int(slot_tokens.size(1))
+        return self.compute_logits(hidden[:, slot_len:, :])
 
 # --- Sliding window evaluation ---
 
@@ -1143,6 +1184,41 @@ def eval_val_sliding(
     return val_loss, bits_per_token * tokens_per_byte
 
 
+def init_slot_tokens_from_trigram_stats(
+    args: Hyperparameters,
+    base_model: nn.Module,
+    token_batch: Tensor,
+) -> Tensor:
+    bsz = int(token_batch.size(0))
+    model_dim = int(base_model.tok_emb.weight.size(1))
+    num_slots = max(int(args.slot_tokens), 1)
+    fallback = torch.zeros(
+        bsz, num_slots, model_dim, dtype=torch.float32, device=token_batch.device
+    )
+    bigram = getattr(base_model, "bigram", None)
+    if bigram is None or token_batch.size(1) < 3:
+        return fallback
+
+    trigram_hashes = bigram.trigram_hash(token_batch)[:, 2:].reshape(-1)
+    if trigram_hashes.numel() == 0:
+        return fallback
+    counts = torch.bincount(trigram_hashes, minlength=int(bigram.bigram_vocab_size))
+    nz = torch.nonzero(counts > 0, as_tuple=False).reshape(-1)
+    if nz.numel() == 0:
+        return fallback
+
+    topk = min(max(int(args.slot_trigram_topk), 1), int(nz.numel()))
+    nz_counts = counts[nz]
+    top_local = torch.topk(nz_counts, k=topk).indices
+    top_ids = nz[top_local]
+
+    trigram_mean = bigram.embed(top_ids).float().mean(dim=0, keepdim=True)
+    if bigram.proj is not None:
+        trigram_mean = F.linear(trigram_mean, bigram.proj.weight.float())
+    trigram_mean = trigram_mean * bigram.scale.float()
+    return trigram_mean.view(1, 1, model_dim).repeat(bsz, num_slots, 1).contiguous()
+
+
 def eval_val_slot(
     args: Hyperparameters,
     base_model: nn.Module,
@@ -1156,62 +1232,69 @@ def eval_val_slot(
     ws_list = list(range(0, total_tok, stride))
     ws_list = [ws for ws in ws_list if min(ws + seq_s, total_tok) - ws >= 1]
     my_ws = ws_list[rank::world_size]
-    if args.tie_embeddings:
-        proj_w = base_model.tok_emb.weight.detach().float()
-    else:
-        proj_w = base_model.lm_head.weight.detach().float()
-    softcap = base_model.logit_softcap
-    compiled_hidden = torch.compile(base_model.forward_hidden, dynamic=False, fullgraph=False)
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_sum = torch.zeros((), device=device, dtype=torch.float64)
     base_model.eval()
-    for bi in range(0, len(my_ws), args.slot_batch_seqs):
-        bws = my_ws[bi:bi + args.slot_batch_seqs]
-        bsz = len(bws)
-        xb_cpu = torch.zeros(bsz, seq_s, dtype=torch.int64)
-        yb_cpu = torch.zeros(bsz, seq_s, dtype=torch.int64)
-        wlens = []
-        for i, ws in enumerate(bws):
-            wend = min(ws + seq_s, total_tok)
-            wlen = wend - ws
-            wlens.append(wlen)
-            xb_cpu[i, :wlen] = val_tokens[ws:wend]
-            yb_cpu[i, :wlen] = val_tokens[ws + 1:wend + 1]
-        xb = xb_cpu.to(device=device, non_blocking=True)
-        yb = yb_cpu.to(device=device, non_blocking=True)
-        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            hidden = compiled_hidden(xb)
-        hidden_f = hidden.detach().float()
-        mask = torch.zeros(bsz, seq_s, device=device)
-        for i, ws in enumerate(bws):
-            wlen = wlens[i]
-            s = 0 if ws == 0 else max(wlen - stride, 0)
-            mask[i, s:wlen] = 1.0
-        valid_count = mask.sum()
-        if valid_count == 0:
-            continue
-        delta = torch.zeros(bsz, 1, hidden_f.size(-1), device=device, dtype=torch.float32, requires_grad=True)
-        logit_bias = torch.zeros(bsz, 1, proj_w.size(0), device=device, dtype=torch.float32, requires_grad=True)
-        slot_opt = torch.optim.AdamW([delta, logit_bias], lr=args.slot_lr, weight_decay=1e-8, eps=1e-5)
-        targets_flat = yb.reshape(-1)
-        for step_i in range(args.slot_steps):
-            lr_t = args.slot_lr_min + 0.5 * (args.slot_lr - args.slot_lr_min) * (1 + math.cos(math.pi * step_i / args.slot_steps))
-            for pg in slot_opt.param_groups:
-                pg["lr"] = lr_t
-            slot_opt.zero_grad()
-            h = hidden_f + delta
-            lp = F.linear(h, proj_w) + logit_bias
-            lg = softcap * torch.tanh(lp / softcap)
-            nll = F.cross_entropy(lg.reshape(-1, lg.size(-1)), targets_flat, reduction="none").reshape(bsz, seq_s)
-            slot_loss = (nll * mask).sum() / valid_count
-            slot_loss.backward()
-            slot_opt.step()
-        with torch.no_grad():
-            h = hidden_f + delta.detach()
-            lp = F.linear(h, proj_w) + logit_bias.detach()
-            lg = softcap * torch.tanh(lp / softcap)
-            nll = F.cross_entropy(lg.reshape(-1, lg.size(-1)), targets_flat, reduction="none").reshape(bsz, seq_s)
+    trainable_params: list[Tensor] = []
+    for p in base_model.parameters():
+        if p.requires_grad:
+            p.requires_grad_(False)
+            trainable_params.append(p)
+    try:
+        for bi in range(0, len(my_ws), args.slot_batch_seqs):
+            bws = my_ws[bi:bi + args.slot_batch_seqs]
+            bsz = len(bws)
+            xb_cpu = torch.zeros(bsz, seq_s, dtype=torch.int64)
+            yb_cpu = torch.zeros(bsz, seq_s, dtype=torch.int64)
+            wlens = []
+            for i, ws in enumerate(bws):
+                wend = min(ws + seq_s, total_tok)
+                wlen = wend - ws
+                wlens.append(wlen)
+                xb_cpu[i, :wlen] = val_tokens[ws:wend]
+                yb_cpu[i, :wlen] = val_tokens[ws + 1:wend + 1]
+            xb = xb_cpu.to(device=device, non_blocking=True)
+            yb = yb_cpu.to(device=device, non_blocking=True)
+            mask = torch.zeros(bsz, seq_s, device=device)
+            for i, ws in enumerate(bws):
+                wlen = wlens[i]
+                s = 0 if ws == 0 else max(wlen - stride, 0)
+                mask[i, s:wlen] = 1.0
+            valid_count = mask.sum()
+            if valid_count == 0:
+                continue
+
+            slot_tokens = init_slot_tokens_from_trigram_stats(args, base_model, xb)
+            slot_tokens = slot_tokens.detach().clone().requires_grad_(True)
+            slot_opt = torch.optim.AdamW([slot_tokens], lr=args.slot_lr, weight_decay=1e-8, eps=1e-5)
+            targets_flat = yb.reshape(-1)
+
+            for step_i in range(args.slot_steps):
+                lr_t = args.slot_lr_min + 0.5 * (args.slot_lr - args.slot_lr_min) * (
+                    1 + math.cos(math.pi * step_i / args.slot_steps)
+                )
+                for pg in slot_opt.param_groups:
+                    pg["lr"] = lr_t
+                slot_opt.zero_grad(set_to_none=True)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    logits = base_model.forward_logits_with_slots(xb, slot_tokens)
+                    nll = F.cross_entropy(
+                        logits.reshape(-1, logits.size(-1)).float(),
+                        targets_flat,
+                        reduction="none",
+                    ).reshape(bsz, seq_s)
+                    slot_loss = (nll * mask).sum() / valid_count
+                slot_loss.backward()
+                slot_opt.step()
+
+            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = base_model.forward_logits_with_slots(xb, slot_tokens.detach())
+                nll = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)).float(),
+                    targets_flat,
+                    reduction="none",
+                ).reshape(bsz, seq_s)
             for i, ws in enumerate(bws):
                 wlen = wlens[i]
                 s = 0 if ws == 0 else max(wlen - stride, 0)
@@ -1223,6 +1306,9 @@ def eval_val_slot(
                 tb = base_bytes_lut[tgt_ids].to(torch.float64)
                 tb += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(torch.float64)
                 byte_sum += tb.sum()
+    finally:
+        for p in trainable_params:
+            p.requires_grad_(True)
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
