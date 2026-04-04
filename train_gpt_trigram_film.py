@@ -24,7 +24,12 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-from flash_attn_interface import flash_attn_func as flash_attn_3_func
+try:
+    from flash_attn_interface import flash_attn_func as flash_attn_3_func
+    HAS_FLASH3 = True
+except ImportError:
+    flash_attn_3_func = None
+    HAS_FLASH3 = False
 
 TRIGRAM_ENABLED = os.environ.get("TRIGRAM_ENABLED", os.environ.get("TRIGRAM", "0")) == "1"
 FILM_ENABLED = os.environ.get("FILM_ENABLED", "0") == "1"
@@ -606,6 +611,27 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, rope_dims: int = 0) ->
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
+
+def attention_flash_or_sdp(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+    if HAS_FLASH3:
+        return flash_attn_3_func(q, k, v, causal=True)
+    # F.scaled_dot_product_attention expects [B, H, T, D], while this code uses [B, T, H, D].
+    q_sdp = q.transpose(1, 2)
+    k_sdp = k.transpose(1, 2)
+    v_sdp = v.transpose(1, 2)
+    if q_sdp.size(1) != k_sdp.size(1):
+        if q_sdp.size(1) % k_sdp.size(1) != 0:
+            raise ValueError(
+                f"Invalid GQA head configuration for SDP fallback: q_heads={q_sdp.size(1)} kv_heads={k_sdp.size(1)}"
+            )
+        repeat_factor = q_sdp.size(1) // k_sdp.size(1)
+        k_sdp = k_sdp.repeat_interleave(repeat_factor, dim=1)
+        v_sdp = v_sdp.repeat_interleave(repeat_factor, dim=1)
+    y_sdp = F.scaled_dot_product_attention(
+        q_sdp, k_sdp, v_sdp, attn_mask=None, dropout_p=0.0, is_causal=True
+    )
+    return y_sdp.transpose(1, 2).contiguous()
+
 class CausalSelfAttention(nn.Module):
     def __init__(
         self,
@@ -669,7 +695,7 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin, self.rope_dims)
         k = apply_rotary_emb(k, cos, sin, self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        y = flash_attn_3_func(q, k, v, causal=True)
+        y = attention_flash_or_sdp(q, k, v)
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
         if self.gated_attention:
@@ -1479,7 +1505,7 @@ class _HessianAttn(nn.Module):
         q = apply_rotary_emb(q, cos, sin, self.rope_dims)
         k = apply_rotary_emb(k, cos, sin, self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        y = flash_attn_3_func(q, k, v, causal=True)
+        y = attention_flash_or_sdp(q, k, v)
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
         return self.proj(y.reshape(bsz, seqlen, dim))
