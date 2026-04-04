@@ -447,6 +447,66 @@ def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
     return out
 
 
+@torch.no_grad()
+def run_ternary_roundtrip_checks(
+    model: nn.Module,
+    packed_state: dict[str, Tensor],
+    meta: dict[str, object],
+    restored_state: dict[str, Tensor],
+    log_fn,
+) -> None:
+    if not TERNARY_ENABLED:
+        return
+    first_name: str | None = None
+    first_module: TernaryLinear | None = None
+    for name, module in model.named_modules():
+        if isinstance(module, TernaryLinear):
+            first_name = name
+            first_module = module
+            break
+    if first_name is None or first_module is None:
+        raise RuntimeError("TERNARY_ENABLED=1 but no TernaryLinear layer found for roundtrip checks.")
+
+    weight_key = f"{first_name}.weight"
+    info = meta.get(weight_key)
+    if not (isinstance(info, dict) and info.get("type") == "ternary2"):
+        raise RuntimeError(f"First ternary layer missing ternary2 metadata: {weight_key}")
+
+    if weight_key + ".q2" not in packed_state or weight_key + ".shape" not in packed_state or weight_key + ".scale" not in packed_state:
+        raise RuntimeError(f"Packed ternary payload missing keys for {weight_key}")
+
+    shape_tensor = packed_state[weight_key + ".shape"]
+    shape = tuple(int(v) for v in shape_tensor.tolist())
+    if shape != tuple(first_module.weight.shape):
+        raise RuntimeError(
+            f"Ternary shape restore mismatch for {weight_key}: packed {shape} vs layer {tuple(first_module.weight.shape)}"
+        )
+
+    scale_saved = packed_state[weight_key + ".scale"].float()
+    if scale_saved.numel() != 1:
+        raise RuntimeError(f"Ternary scale for {weight_key} must be scalar, got shape {tuple(scale_saved.shape)}")
+
+    w_orig = first_module.weight.detach().cpu().float().contiguous()
+    scale_orig = w_orig.abs().mean().clamp_min(1e-8)
+    q_orig = (w_orig / scale_orig).round().clamp(-1, 1).to(torch.int8).contiguous()
+    q_restored = unpack_ternary_2bit(packed_state[weight_key + ".q2"], int(np.prod(shape))).view(shape).to(torch.int8)
+    if not torch.equal(q_orig, q_restored):
+        diff_count = int((q_orig != q_restored).sum().item())
+        raise RuntimeError(f"Ternary q roundtrip mismatch for {weight_key}: {diff_count} entries differ.")
+
+    w_expected = q_restored.float() * scale_saved
+    if weight_key not in restored_state:
+        raise RuntimeError(f"Restored state missing {weight_key}")
+    w_restored = restored_state[weight_key].detach().cpu().float().contiguous()
+    max_abs_diff = float((w_expected - w_restored).abs().max().item())
+    log_fn(f"ternary_roundtrip layer:{weight_key} q_bit_exact:True")
+    log_fn(
+        f"ternary_roundtrip layer:{weight_key} scale_saved:{float(scale_saved.item()):.8e} "
+        f"scale_orig:{float(scale_orig.item()):.8e}"
+    )
+    log_fn(f"dequant_sanity layer:{weight_key} max_abs_diff:{max_abs_diff:.8e}")
+
+
 # -----------------------------
 # DATA LOADING
 # -----------------------------
@@ -541,6 +601,8 @@ class TernaryLinear(nn.Module):
         self.out_features = out_features
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
+        self.register_buffer("_static_ternary_weight", torch.empty(0), persistent=False)
+        self._use_static_ternary = False
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -551,13 +613,41 @@ class TernaryLinear(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x: Tensor) -> Tensor:
-        weight = self.weight
-        scale = weight.abs().mean().clamp_min(1e-8)
-        w_q = (weight / scale).round().clamp(-1, 1)
-        w_ste = weight + (w_q - weight).detach()
-        ternary_weight = w_ste * scale
+        if self._use_static_ternary and self._static_ternary_weight.numel() == self.weight.numel():
+            ternary_weight = self._static_ternary_weight
+        else:
+            weight = self.weight
+            scale = weight.abs().mean().clamp_min(1e-8)
+            w_q = (weight / scale).round().clamp(-1, 1)
+            w_ste = weight + (w_q - weight).detach()
+            ternary_weight = w_ste * scale
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, ternary_weight.to(x.dtype), bias)
+
+    @torch.no_grad()
+    def set_static_ternary_weight(self, weight: Tensor) -> None:
+        if tuple(weight.shape) != tuple(self.weight.shape):
+            raise ValueError(
+                f"Static ternary weight shape mismatch: expected {tuple(self.weight.shape)}, got {tuple(weight.shape)}"
+            )
+        self._static_ternary_weight = weight.detach().to(device=self.weight.device, dtype=self.weight.dtype).contiguous()
+        self._use_static_ternary = True
+
+    @torch.no_grad()
+    def clear_static_ternary_weight(self) -> None:
+        self._static_ternary_weight = torch.empty(0, device=self.weight.device, dtype=self.weight.dtype)
+        self._use_static_ternary = False
+
+
+@torch.no_grad()
+def set_static_ternary_weights_from_state(model: nn.Module, state_dict: dict[str, Tensor]) -> None:
+    for name, module in model.named_modules():
+        if not isinstance(module, TernaryLinear):
+            continue
+        key = f"{name}.weight" if name else "weight"
+        if key not in state_dict:
+            raise KeyError(f"Missing ternary weight in restored state: {key}")
+        module.set_static_ternary_weight(state_dict[key])
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -1364,7 +1454,10 @@ def main() -> None:
         decompressed = zlib.decompress(quant_blob_disk)
     quant_state = torch.load(io.BytesIO(decompressed), map_location="cpu")
     deq_state = dequantize_mixed_int6(quant_state["w"], quant_state["m"], sd_cpu)
+    run_ternary_roundtrip_checks(base_model, quant_state["w"], quant_state["m"], deq_state, log0)
     base_model.load_state_dict(deq_state, strict=True)
+    if TERNARY_ENABLED:
+        set_static_ternary_weights_from_state(base_model, deq_state)
 
     # Sliding window eval on int6-roundtripped weights
     torch.cuda.synchronize()
