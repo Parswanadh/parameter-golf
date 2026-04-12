@@ -11,6 +11,7 @@ import sys
 import time
 import uuid
 import zlib
+from contextlib import nullcontext
 from pathlib import Path
 try:
     import zstandard
@@ -1225,37 +1226,39 @@ class GPT(nn.Module):
                 h = x.new_zeros(x.size(0), x.size(2))
         else:
             h = None
-        for _pass_idx in range(self.recurrence_depth):
-            x0_pass = x.to(torch.bfloat16)
-            skips.clear()
-            for i in range(self.num_encoder_layers):
-                if h is not None:
-                    h = self._update_recurrent_state(h, i)
-                    x = self._inject_recurrent_state(x, h, i)
-                if self.film is not None:
-                    x = self.film.condition(x, i)
-                ve = self._get_ve(i, input_ids, ve_cache)
-                x, raw_v = self._run_block(self.blocks[i], x, x0_pass,
-                    self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                    self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
-                    v_embed=ve, v0=v0)
-                if v0 is None and raw_v is not None:
-                    v0 = raw_v
-                skips.append(x)
-            for i in range(self.num_decoder_layers):
-                bi = self.num_encoder_layers + i
-                if skips:
-                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-                if h is not None:
-                    h = self._update_recurrent_state(h, bi)
-                    x = self._inject_recurrent_state(x, h, bi)
-                if self.film is not None:
-                    x = self.film.condition(x, bi)
-                ve = self._get_ve(bi, input_ids, ve_cache)
-                x, _ = self._run_block(self.blocks[bi], x, x0_pass,
-                    self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                    self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
-                    v_embed=ve, v0=v0)
+        for pass_idx in range(self.recurrence_depth):
+            ctx = torch.no_grad() if pass_idx < self.recurrence_depth - 1 else nullcontext()
+            with ctx:
+                x0_pass = x.to(torch.bfloat16)
+                skips.clear()
+                for i in range(self.num_encoder_layers):
+                    if h is not None:
+                        h = self._update_recurrent_state(h, i)
+                        x = self._inject_recurrent_state(x, h, i)
+                    if self.film is not None:
+                        x = self.film.condition(x, i)
+                    ve = self._get_ve(i, input_ids, ve_cache)
+                    x, raw_v = self._run_block(self.blocks[i], x, x0_pass,
+                        self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
+                        self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+                        v_embed=ve, v0=v0)
+                    if v0 is None and raw_v is not None:
+                        v0 = raw_v
+                    skips.append(x)
+                for i in range(self.num_decoder_layers):
+                    bi = self.num_encoder_layers + i
+                    if skips:
+                        x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                    if h is not None:
+                        h = self._update_recurrent_state(h, bi)
+                        x = self._inject_recurrent_state(x, h, bi)
+                    if self.film is not None:
+                        x = self.film.condition(x, bi)
+                    ve = self._get_ve(bi, input_ids, ve_cache)
+                    x, _ = self._run_block(self.blocks[bi], x, x0_pass,
+                        self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
+                        self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
+                        v_embed=ve, v0=v0)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -2435,8 +2438,6 @@ def main() -> None:
                     else:
                         warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
-                if x_recur is not None:
-                    x_recur = x_recur.detach()
             # All-reduce all grads for warmup (simple, not optimized)
             if distributed:
                 for p in base_model.parameters():
@@ -2536,8 +2537,6 @@ def main() -> None:
                 torch.cuda.synchronize()
                 t_phase = time.perf_counter()
             (loss * grad_scale).backward()
-            if x_recur is not None:
-                x_recur = x_recur.detach()
             if profile_step5:
                 torch.cuda.synchronize()
                 profile_backward_ms += 1000.0 * (time.perf_counter() - t_phase)
