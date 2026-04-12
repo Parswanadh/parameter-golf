@@ -159,10 +159,7 @@ class Hyperparameters:
     num_layers = int(os.environ.get("NUM_LAYERS", "13" if scale_to_vram else "11"))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", "640" if scale_to_vram else "512"))
-    micro_batch_size = max(int(os.environ.get("MICRO_BATCH_SIZE", 2)), 1)
-    _default_grad_accum_steps = max(1, 8 // micro_batch_size)
-    grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", _default_grad_accum_steps))
-    grad_ckpt = bool(int(os.environ.get("GRAD_CKPT", "1")))
+    micro_batch_size = max(int(os.environ.get("MICRO_BATCH_SIZE", 6)), 1)
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 3.0))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
@@ -997,7 +994,6 @@ class GPT(nn.Module):
         trigram_enabled: bool = False,
         film_enabled: bool = False,
         recurrence_enabled: bool = False,
-        grad_ckpt: bool = False,
         parallel_residuals: bool = False,
         xsa_last_n: int = 0,
         rope_dims: int = 0,
@@ -1024,7 +1020,6 @@ class GPT(nn.Module):
         self.smear = SmearGate(model_dim)
         self.film = FiLMDepthCondition(num_layers, model_dim) if film_enabled else None
         self.recurrence_enabled = recurrence_enabled
-        self.grad_ckpt = grad_ckpt
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -1160,29 +1155,18 @@ class GPT(nn.Module):
         v_embed: Tensor | None = None,
         v0: Tensor | None = None,
     ) -> tuple[Tensor, Tensor | None]:
-        use_ckpt = (
-            self.grad_ckpt
-            and self.recurrence_enabled
-            and self.training
+        return block(
+            x, x0, q_w, k_w, v_w, out_w, up_w, down_w,
+            v_embed=v_embed, v0=v0
         )
-        need_raw_v = self.value_residual and v0 is None
-        if not use_ckpt or need_raw_v:
-            return block(
-                x, x0, q_w, k_w, v_w, out_w, up_w, down_w,
-                v_embed=v_embed, v0=v0
-            )
 
-        def _ckpt_block(x_in: Tensor) -> Tensor:
-            x_out, _ = block(
-                x_in, x0, q_w, k_w, v_w, out_w, up_w, down_w,
-                v_embed=v_embed, v0=v0
-            )
-            return x_out
-
-        x_out = torch.utils.checkpoint.checkpoint(_ckpt_block, x, use_reentrant=False)
-        return x_out, None
-
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward(
+        self,
+        input_ids: Tensor,
+        target_ids: Tensor,
+        recurrence_state: Tensor | None = None,
+        return_recurrence_state: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor | None]:
         n = self.num_layers
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
@@ -1195,7 +1179,22 @@ class GPT(nn.Module):
         v0 = None
         skips: list[Tensor] = []
         ve_cache: dict = {}
-        h = x.new_zeros(x.size(0), x.size(2)) if self.recurrence_enabled else None
+        if self.recurrence_enabled:
+            if recurrence_state is not None:
+                if recurrence_state.ndim != 2:
+                    raise ValueError(
+                        f"recurrence_state must be rank-2 [B,C], got shape {tuple(recurrence_state.shape)}"
+                    )
+                if recurrence_state.size(0) != x.size(0) or recurrence_state.size(1) != x.size(2):
+                    raise ValueError(
+                        f"recurrence_state shape mismatch: expected ({x.size(0)}, {x.size(2)}), "
+                        f"got {tuple(recurrence_state.shape)}"
+                    )
+                h = recurrence_state.to(dtype=x.dtype, device=x.device)
+            else:
+                h = x.new_zeros(x.size(0), x.size(2))
+        else:
+            h = None
         for i in range(self.num_encoder_layers):
             if h is not None:
                 h = self._update_recurrent_state(h, i)
@@ -1251,6 +1250,8 @@ class GPT(nn.Module):
                 mtp_loss_count += 1
             if mtp_loss_count > 0:
                 main_loss = main_loss + self.mtp_loss_weight * (mtp_loss_sum / mtp_loss_count)
+        if return_recurrence_state:
+            return main_loss, h
         return main_loss
     def _forward_hidden_with_optional_slots(
         self,
@@ -2098,9 +2099,20 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
-    if args.grad_accum_steps <= 0:
-        raise ValueError(f"GRAD_ACCUM_STEPS must be positive, got {args.grad_accum_steps}")
-    grad_accum_steps = args.grad_accum_steps
+    micro_tokens_global = args.micro_batch_size * args.train_seq_len * world_size
+    if micro_tokens_global <= 0:
+        raise ValueError(
+            "Invalid micro-batch config: "
+            f"MICRO_BATCH_SIZE={args.micro_batch_size}, TRAIN_SEQ_LEN={args.train_seq_len}, WORLD_SIZE={world_size}"
+        )
+    if args.train_batch_tokens % micro_tokens_global != 0:
+        raise ValueError(
+            f"TRAIN_BATCH_TOKENS={args.train_batch_tokens} must be divisible by "
+            f"(MICRO_BATCH_SIZE * TRAIN_SEQ_LEN * WORLD_SIZE)={micro_tokens_global}"
+        )
+    grad_accum_steps = args.train_batch_tokens // micro_tokens_global
+    if grad_accum_steps <= 0:
+        raise ValueError(f"Computed GRAD_ACCUM_STEPS must be positive, got {grad_accum_steps}")
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -2181,7 +2193,6 @@ def main() -> None:
         trigram_enabled=args.trigram_enabled,
         film_enabled=args.film_enabled,
         recurrence_enabled=args.recurrence_enabled,
-        grad_ckpt=args.grad_ckpt,
         parallel_residuals=args.parallel_residuals,
         xsa_last_n=args.xsa_last_n,
         rope_dims=args.rope_dims,
@@ -2318,7 +2329,7 @@ def main() -> None:
         f"feature_flags trigram_enabled:{int(args.trigram_enabled)} "
         f"film_enabled:{int(args.film_enabled)} slot_enabled:{int(args.slot_enabled)} "
         f"recurrence_enabled:{int(args.recurrence_enabled)} parallel_residuals:{int(args.parallel_residuals)} "
-        f"sdclip_enabled:{int(args.sdclip_enabled)} grad_ckpt:{int(args.grad_ckpt)} "
+        f"sdclip_enabled:{int(args.sdclip_enabled)} "
         f"scale_to_vram:{int(args.scale_to_vram)} "
         f"torch_compile:{int(TORCH_COMPILE_ENABLED)}"
     )
@@ -2363,11 +2374,22 @@ def main() -> None:
         model.train()
         for warmup_step in range(args.warmup_steps):
             zero_grad_all()
+            x_recur = None
             for micro_step in range(grad_accum_steps):
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y)
+                    if args.recurrence_enabled:
+                        warmup_loss, x_recur = model(
+                            x,
+                            y,
+                            recurrence_state=x_recur,
+                            return_recurrence_state=True,
+                        )
+                    else:
+                        warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
+                if x_recur is not None:
+                    x_recur = x_recur.detach()
             # All-reduce all grads for warmup (simple, not optimized)
             if distributed:
                 for p in base_model.parameters():
@@ -2443,13 +2465,22 @@ def main() -> None:
         profile_clip_ms = 0.0
         profile_optim_ms = 0.0
         train_loss = torch.zeros((), device=device)
+        x_recur = None
         for micro_step in range(grad_accum_steps):
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             if profile_step5:
                 torch.cuda.synchronize()
                 t_phase = time.perf_counter()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
+                if args.recurrence_enabled:
+                    loss, x_recur = model(
+                        x,
+                        y,
+                        recurrence_state=x_recur,
+                        return_recurrence_state=True,
+                    )
+                else:
+                    loss = model(x, y)
             if profile_step5:
                 torch.cuda.synchronize()
                 profile_forward_ms += 1000.0 * (time.perf_counter() - t_phase)
@@ -2458,6 +2489,8 @@ def main() -> None:
                 torch.cuda.synchronize()
                 t_phase = time.perf_counter()
             (loss * grad_scale).backward()
+            if x_recur is not None:
+                x_recur = x_recur.detach()
             if profile_step5:
                 torch.cuda.synchronize()
                 profile_backward_ms += 1000.0 * (time.perf_counter() - t_phase)
@@ -2714,7 +2747,6 @@ def main() -> None:
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
         trigram_enabled=args.trigram_enabled, film_enabled=args.film_enabled,
         recurrence_enabled=args.recurrence_enabled, parallel_residuals=args.parallel_residuals,
-        grad_ckpt=args.grad_ckpt,
         xsa_last_n=args.xsa_last_n,
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
