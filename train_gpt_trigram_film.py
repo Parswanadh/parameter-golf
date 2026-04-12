@@ -2398,8 +2398,6 @@ def main() -> None:
                     else:
                         warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
-                if x_recur is not None:
-                    x_recur = x_recur.detach()
             # All-reduce all grads for warmup (simple, not optimized)
             if distributed:
                 for p in base_model.parameters():
@@ -2499,8 +2497,6 @@ def main() -> None:
                 torch.cuda.synchronize()
                 t_phase = time.perf_counter()
             (loss * grad_scale).backward()
-            if x_recur is not None:
-                x_recur = x_recur.detach()
             if profile_step5:
                 torch.cuda.synchronize()
                 profile_backward_ms += 1000.0 * (time.perf_counter() - t_phase)
