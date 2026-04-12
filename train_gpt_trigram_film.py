@@ -218,6 +218,7 @@ class Hyperparameters:
     recurrence_lr = float(os.environ.get("RECURRENCE_LR", 3e-4))
     sdclip_enabled = bool(int(os.environ.get("SDCLIP_ENABLED", "1")))
     sdclip_threshold = float(os.environ.get("SDCLIP_THRESHOLD", 1.0))
+    sdclip_freq = int(os.environ.get("SDCLIP_FREQ", 10))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -679,7 +680,7 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
 
 
 @torch.no_grad()
-def apply_sdclip(module: nn.Module, threshold: float) -> None:
+def apply_sdclip(module: nn.Module, threshold: float, min_dim: int = 256) -> None:
     if threshold <= 0.0:
         return
     for param in module.parameters():
@@ -687,6 +688,9 @@ def apply_sdclip(module: nn.Module, threshold: float) -> None:
         if grad is None or grad.ndim < 2:
             continue
         grad_fp32 = grad.float()
+        rows, cols = int(grad_fp32.shape[-2]), int(grad_fp32.shape[-1])
+        if rows < min_dim or cols < min_dim:
+            continue
         if grad_fp32.ndim == 2:
             u, s, vh = torch.linalg.svd(grad_fp32, full_matrices=False)
             s = s.clamp(max=threshold)
@@ -2274,7 +2278,8 @@ def main() -> None:
         f"feature_flags trigram_enabled:{int(args.trigram_enabled)} "
         f"film_enabled:{int(args.film_enabled)} slot_enabled:{int(args.slot_enabled)} "
         f"recurrence_enabled:{int(args.recurrence_enabled)} parallel_residuals:{int(args.parallel_residuals)} "
-        f"sdclip_enabled:{int(args.sdclip_enabled)} torch_compile:{int(TORCH_COMPILE_ENABLED)}"
+        f"sdclip_enabled:{int(args.sdclip_enabled)} sdclip_freq:{args.sdclip_freq} "
+        f"torch_compile:{int(TORCH_COMPILE_ENABLED)}"
     )
     xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
@@ -2336,6 +2341,7 @@ def main() -> None:
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
+    swa_started = False
     from collections import deque
     lawa_queue: deque[dict[str, Tensor]] = deque(maxlen=args.lawa_k)
     ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
@@ -2407,8 +2413,8 @@ def main() -> None:
                     group["lr"] = group["base_lr"] * scale
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
-        if args.sdclip_enabled:
-            apply_sdclip(base_model, args.sdclip_threshold)
+        if args.sdclip_enabled and args.sdclip_freq > 0 and (step % args.sdclip_freq == 0):
+            apply_sdclip(base_model, args.sdclip_threshold, min_dim=256)
         # === 3-phase overlapped optimizer step ===
         # Phase 1: Launch async reduce-scatter for banks (biggest first)
         optimizer_muon.launch_reduce_scatters()
@@ -2433,10 +2439,17 @@ def main() -> None:
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         if args.swa_enabled and scale < 0.2 and step % args.swa_every == 0:
-            if swa_state is None:
+            if not swa_started:
+                print(f"swa_debug:init_enter step:{step} rank:{rank}", flush=True)
+                swa_started = True
+                print(f"swa_debug:init_set_started step:{step} rank:{rank}", flush=True)
+                log0(f"swa:start step:{step}")
+                print(f"swa_debug:init_logged_start step:{step} rank:{rank}", flush=True)
+                print(f"swa_debug:init_exit step:{step} rank:{rank}", flush=True)
+            elif swa_state is None:
                 swa_state = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
                 swa_count = 1
-                log0(f"swa:start step:{step}")
+                log0(f"swa:collect step:{step} count:{swa_count}")
             else:
                 for name, t in base_model.state_dict().items():
                     swa_state[name] += t.detach().cpu()
