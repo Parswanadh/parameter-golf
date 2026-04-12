@@ -159,7 +159,7 @@ class Hyperparameters:
     num_layers = int(os.environ.get("NUM_LAYERS", "13" if scale_to_vram else "11"))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", "640" if scale_to_vram else "512"))
-    micro_batch_size = max(int(os.environ.get("MICRO_BATCH_SIZE", 6)), 1)
+    grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", 8))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 3.0))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
@@ -2099,20 +2099,30 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
-    micro_tokens_global = args.micro_batch_size * args.train_seq_len * world_size
-    if micro_tokens_global <= 0:
+    if args.grad_accum_steps <= 0:
+        raise ValueError(f"GRAD_ACCUM_STEPS must be positive, got {args.grad_accum_steps}")
+    grad_accum_steps = args.grad_accum_steps
+    denom_tokens = world_size * grad_accum_steps
+    if denom_tokens <= 0:
         raise ValueError(
-            "Invalid micro-batch config: "
-            f"MICRO_BATCH_SIZE={args.micro_batch_size}, TRAIN_SEQ_LEN={args.train_seq_len}, WORLD_SIZE={world_size}"
+            f"Invalid accumulation config: WORLD_SIZE={world_size}, GRAD_ACCUM_STEPS={grad_accum_steps}"
         )
-    if args.train_batch_tokens % micro_tokens_global != 0:
+    if args.train_batch_tokens % denom_tokens != 0:
         raise ValueError(
             f"TRAIN_BATCH_TOKENS={args.train_batch_tokens} must be divisible by "
-            f"(MICRO_BATCH_SIZE * TRAIN_SEQ_LEN * WORLD_SIZE)={micro_tokens_global}"
+            f"(WORLD_SIZE * GRAD_ACCUM_STEPS)={denom_tokens}"
         )
-    grad_accum_steps = args.train_batch_tokens // micro_tokens_global
-    if grad_accum_steps <= 0:
-        raise ValueError(f"Computed GRAD_ACCUM_STEPS must be positive, got {grad_accum_steps}")
+    local_tokens = args.train_batch_tokens // denom_tokens
+    if local_tokens <= 0:
+        raise ValueError(
+            f"Computed local tokens must be positive, got {local_tokens} "
+            f"(TRAIN_BATCH_TOKENS={args.train_batch_tokens}, denom={denom_tokens})"
+        )
+    if local_tokens % args.train_seq_len != 0:
+        raise ValueError(
+            f"Per-micro local tokens {local_tokens} must be divisible by TRAIN_SEQ_LEN={args.train_seq_len}"
+        )
+    micro_batch_size = local_tokens // args.train_seq_len
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -2337,7 +2347,7 @@ def main() -> None:
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
     log0(
         f"world_size:{world_size} grad_accum_steps:{grad_accum_steps} "
-        f"micro_batch_size:{args.micro_batch_size}"
+        f"micro_batch_size:{micro_batch_size}"
     )
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
